@@ -4,7 +4,7 @@
 #include "lune_protocol.h"
 
 namespace Radio {
-void begin(const char *roverName);
+void begin(const char *roverName, uint8_t roverNumber);  // name goes in PAIR_ACK
 void loop();                        // finishes pairing (flash writes) outside the Wi-Fi task
 bool paired();
 bool pairing();

@@ -6,18 +6,34 @@
 #include "config.h"
 #include "control.h"
 
+// Pairing, safe with a room full of rovers:
+//   1. Connect broadcasts PAIR_REQ.
+//   2. A rover answers with PAIR_ACK only if it is unpaired or in pairing mode
+//      AND the request is strong (Connect held close, >= PAIR_RSSI_MIN), or if
+//      the request comes from the Connect it already knows.
+//   3. Connect waits a moment, picks the strongest ACK and starts sending
+//      CONTROL to that one rover.
+//   4. Only the rover that receives CONTROL from the candidate stores the
+//      pairing. Every other rover that answered forgets it after a few seconds.
+
 namespace {
 const uint8_t BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-char name[12] = "Lun-E Glyph";
+char name[12] = "Lun-E";
+uint8_t number = 0;
 uint8_t peerMac[6] = {0};
 volatile bool hasPeer = false;
 volatile uint32_t pairingUntil = 0;
 
-// Pairing request captured in the Wi-Fi task, completed in loop().
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
-volatile bool pendingPair = false;
+// Step 2: PAIR_REQ seen in the Wi-Fi task, answered from loop().
+volatile bool pendingAck = false;
 uint8_t pendingMac[6];
+// Step 4: candidate Connect waiting for its first CONTROL.
+uint8_t candMac[6];
+volatile bool hasCand = false;
+volatile uint32_t candUntil = 0;
+volatile bool commitPending = false;
 volatile bool pairedEvent = false;
 
 volatile uint32_t lastConnectMs = 0;
@@ -28,6 +44,7 @@ bool seqInit = false;
 uint8_t txSeq = 0;
 
 bool isPairing() { return (int32_t)(pairingUntil - millis()) > 0; }
+bool isPeer(const uint8_t *mac) { return hasPeer && memcmp(mac, peerMac, 6) == 0; }
 
 void addPeer(const uint8_t *mac) {
   if (esp_now_is_peer_exist(mac)) return;
@@ -39,10 +56,15 @@ void addPeer(const uint8_t *mac) {
   esp_now_add_peer(&p);
 }
 
+void dropPeer(const uint8_t *mac) {
+  if (esp_now_is_peer_exist(mac)) esp_now_del_peer(mac);
+}
+
 void sendAck(const uint8_t *mac) {
   LunePairAck ack = {};
   luneFillHeader(ack.h, LUNE_PKT_PAIR_ACK, txSeq++);
   strncpy(ack.name, name, sizeof(ack.name));
+  ack.number = number;
   esp_now_send(mac, (const uint8_t *)&ack, sizeof(ack));
 }
 
@@ -50,24 +72,28 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (!luneHeaderValid(data, len)) return;
   const uint8_t *src = info->src_addr;
   uint8_t type = ((const LuneHeader *)data)->type;
+  int8_t rssi = info->rx_ctrl ? (int8_t)info->rx_ctrl->rssi : -127;
 
   if (type == LUNE_PKT_PAIR_REQ && len >= (int)sizeof(LunePairReq)) {
-    // Accept when unpaired or in pairing mode, or re-ack the Connect we already know.
-    bool known = hasPeer && memcmp(src, peerMac, 6) == 0;
-    if (!hasPeer || isPairing() || known) {
+    bool open = !hasPeer || isPairing();
+    if (isPeer(src) || (open && rssi >= PAIR_RSSI_MIN)) {
       portENTER_CRITICAL(&mux);
       memcpy(pendingMac, src, 6);
-      pendingPair = true;
+      pendingAck = true;
       portEXIT_CRITICAL(&mux);
     }
     return;
   }
 
   if (type == LUNE_PKT_CONTROL && len >= (int)sizeof(LuneControl)) {
-    if (!hasPeer || memcmp(src, peerMac, 6) != 0) return;  // not our controller
+    if (!isPeer(src)) {
+      // First CONTROL from the Connect we just answered: it picked us.
+      if (hasCand && memcmp(src, candMac, 6) == 0) commitPending = true;
+      return;
+    }
     const LuneControl *c = (const LuneControl *)data;
     lastConnectMs = millis();
-    if (info->rx_ctrl) lastRssi = info->rx_ctrl->rssi;
+    lastRssi = rssi;
     Control::submit(LUNE_SRC_CONNECT, c->x, c->y, c->maxSpeed);
     if (!seqInit) {
       lastMoodSeq = c->moodSeq;
@@ -89,8 +115,9 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
 
 namespace Radio {
 
-void begin(const char *roverName) {
+void begin(const char *roverName, uint8_t roverNumber) {
   strncpy(name, roverName, sizeof(name) - 1);
+  number = roverNumber;
 
   Preferences prefs;
   prefs.begin("lune", true);
@@ -111,29 +138,46 @@ void begin(const char *roverName) {
 }
 
 void loop() {
-  if (!pendingPair) return;
-  uint8_t mac[6];
-  portENTER_CRITICAL(&mux);
-  memcpy(mac, pendingMac, 6);
-  pendingPair = false;
-  portEXIT_CRITICAL(&mux);
+  // Step 2: answer a PAIR_REQ.
+  if (pendingAck) {
+    uint8_t mac[6];
+    portENTER_CRITICAL(&mux);
+    memcpy(mac, pendingMac, 6);
+    pendingAck = false;
+    portEXIT_CRITICAL(&mux);
+    addPeer(mac);  // needed to unicast the ACK
+    if (!isPeer(mac)) {
+      if (hasCand && memcmp(mac, candMac, 6) != 0) dropPeer(candMac);
+      memcpy(candMac, mac, 6);
+      candUntil = millis() + PAIR_CANDIDATE_MS;
+      hasCand = true;
+    }
+    sendAck(mac);
+  }
 
-  bool changed = !hasPeer || memcmp(mac, peerMac, 6) != 0;
-  if (changed) {
-    if (hasPeer && esp_now_is_peer_exist(peerMac)) esp_now_del_peer(peerMac);
-    memcpy(peerMac, mac, 6);
+  // Step 4: the Connect chose us — store it.
+  if (commitPending) {
+    commitPending = false;
+    if (hasPeer) dropPeer(peerMac);
+    memcpy(peerMac, candMac, 6);
     hasPeer = true;
+    hasCand = false;
     seqInit = false;
+    pairingUntil = 0;
     Preferences prefs;
     prefs.begin("lune", false);
     prefs.putBytes("peer", peerMac, 6);
     prefs.end();
     pairedEvent = true;
-    log_i("Paired with %02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    log_i("Paired with %02X:%02X:%02X:%02X:%02X:%02X", peerMac[0], peerMac[1], peerMac[2],
+          peerMac[3], peerMac[4], peerMac[5]);
   }
-  addPeer(mac);
-  pairingUntil = 0;
-  sendAck(mac);
+
+  // A Connect we answered picked another rover: forget it.
+  if (hasCand && (int32_t)(millis() - candUntil) > 0) {
+    hasCand = false;
+    if (!isPeer(candMac)) dropPeer(candMac);
+  }
 }
 
 bool paired() { return hasPeer; }
@@ -151,6 +195,7 @@ int8_t rssi() { return lastRssi; }
 void sendTelemetry(LuneTelemetry &t) {
   if (!hasPeer) return;
   luneFillHeader(t.h, LUNE_PKT_TELEMETRY, txSeq++);
+  t.number = number;
   esp_now_send(peerMac, (const uint8_t *)&t, sizeof(t));
 }
 

@@ -45,6 +45,12 @@
 #define HANDOVER_IDLE_MS   300    // other source may take over after the owner is neutral this long
 #define CONNECT_LINK_MS    1000   // Connect counts as "linked" if heard within this
 #define PAIRING_WINDOW_MS  30000
+// Pairing in a crowd: only answer a Connect held close to this rover. Raise
+// towards -50 if two neighbours both answer; lower towards -70 if pairing fails.
+#define PAIR_RSSI_MIN      -60    // dBm
+#define PAIR_CANDIDATE_MS  3000   // forget an answered Connect that picked another rover
+#define IDENTIFY_MS        3000   // how long "find me" shows the number
+#define IDENTIFY_WIGGLE_MS 700    // little left-right shimmy when identified (0 = off)
 #define TELEMETRY_MS       200    // rover -> Connect / app status rate
 
 // ---- Power -----------------------------------------------------------------

@@ -7,9 +7,13 @@
 // once the owner has been neutral for HANDOVER_IDLE_MS. Motors stop if the
 // owner goes quiet for FAILSAFE_MS.
 //
-// Button (GPIO5):  click = next eye expression · double-click = pair a Connect (30 s)
+// Button (GPIO0):  click = next eye expression · double-click = show who I am
+//                  (number big on the OLED) · triple-click = pair a Connect (30 s)
 //                  hold 1.5 s = eyes fall asleep, release = deep sleep · press to wake.
-// Headlights (GPIO1 / GPIO20): OFF after wake-up. Connect stick click cycles
+// Rover number 1..99 is set from the app (Setup → rover number) and kept in
+// flash; the rover then advertises as "Lun-E 07". Unnumbered rovers use the
+// end of their MAC (e.g. "Lun-E Glyph-A3F1").
+// Headlights (pins TBD, disabled): OFF after wake-up. Connect stick click cycles
 //                  off/33/66/100 %; app has a toggle + brightness slider.
 //                  Cues: alternate while pairing · 3 fast blinks paired · 2 blinks
 //                  linked · long flash link lost · 1 blink new expression ·
@@ -31,6 +35,9 @@
 #include "radio.h"
 
 static char roverName[20];
+static char roverId[8];        // "07" / "A3F1" — what the OLED shows for find-me
+static uint8_t roverNumber = 0;
+static uint32_t wiggleFrom = 0, wiggleUntil = 0;
 static int8_t trim = 0;
 static uint8_t owner = LUNE_SRC_NONE;
 static uint32_t lastActivityMs = 0;
@@ -118,6 +125,14 @@ static void saveLightsIfSettled(bool force) {
   prefs.end();
 }
 
+// "Find me": number big on the OLED, headlights blink, a little shimmy.
+static void identify() {
+  Eyes::showId(roverId, IDENTIFY_MS);
+  Headlights::blink(5, 90, 90);
+  wiggleFrom = millis();
+  wiggleUntil = wiggleFrom + IDENTIFY_WIGGLE_MS;
+}
+
 static void handleCmd(const RoverCmd &c) {
   switch (c.cmd) {
     case LUNE_CMD_MOOD:
@@ -147,6 +162,29 @@ static void handleCmd(const RoverCmd &c) {
     case LUNE_CMD_SLEEP:
       goToSleep();
       break;
+    case LUNE_CMD_IDENTIFY:
+      identify();
+      break;
+    case LUNE_CMD_NUMBER: {
+      uint8_t n = (uint8_t)c.arg;
+      if (n > 99) break;
+      Preferences prefs;
+      prefs.begin("lune", false);
+      prefs.putUChar("num", n);
+      prefs.end();
+      char id[8];
+      if (n) snprintf(id, sizeof(id), "%02u", (unsigned)n);
+      else snprintf(id, sizeof(id), "--");
+      Eyes::showId(id, 2500);
+      Headlights::cuePaired();
+      // Restart so Bluetooth advertises the new name. Give the app's write a
+      // moment to be acknowledged first.
+      Motors::stopNow();
+      saveLightsIfSettled(true);
+      delay(1800);
+      ESP.restart();
+      break;
+    }
   }
   lastActivityMs = millis();
 }
@@ -187,6 +225,7 @@ static void pollButton() {
   }
   if (!stable && clicks && now - lastReleaseAt > 350) {
     if (clicks == 1) Control::pushCmd(LUNE_CMD_MOOD, MOOD_ARG_NEXT, LUNE_SRC_NONE);
+    else if (clicks == 2) Eyes::showId(roverId, IDENTIFY_MS);  // "who am I": number on the OLED
     else Control::pushCmd(LUNE_CMD_PAIR, 0, LUNE_SRC_NONE);
     clicks = 0;
   }
@@ -235,7 +274,13 @@ static void driveUpdate() {
   l *= 1.0f + trim / 100.0f;
   r *= 1.0f - trim / 100.0f;
   float k = maxSpeed / 100.0f;
-  Motors::setTarget((int)lroundf(l * k), (int)lroundf(r * k));
+  if (!x && !y && (int32_t)(wiggleUntil - now) > 0) {
+    // Find-me shimmy: twist left/right in place, only while nobody is driving.
+    int dir = ((now - wiggleFrom) / 140) % 2 ? 1 : -1;
+    Motors::setTarget(45 * dir, -45 * dir);
+  } else {
+    Motors::setTarget((int)lroundf(l * k), (int)lroundf(r * k));
+  }
 
   Eyes::lookAt(x, y, x || y);
 }
@@ -277,6 +322,7 @@ static void publishStatus() {
   s.connectRssi = Radio::rssi();
   s.uptimeS = (uint16_t)min<uint32_t>(millis() / 1000, 65535);
   s.lights = Headlights::level();
+  s.number = roverNumber;
   BleApp::publishStatus(s);
 }
 
@@ -290,23 +336,30 @@ void setup() {
   Serial.begin(115200);
   delay(50);
 
-  uint8_t mac[6];
-  esp_read_mac(mac, ESP_MAC_WIFI_STA);
-  snprintf(roverName, sizeof(roverName), "%s Glyph-%02X%02X", LUNE_BLE_NAME_PREFIX, mac[4], mac[5]);
-  Serial.printf("[lune] %s  MAC %02X:%02X:%02X:%02X:%02X:%02X\n", roverName, mac[0], mac[1], mac[2],
-                mac[3], mac[4], mac[5]);
-
   Preferences prefs;
   prefs.begin("lune", true);
   trim = prefs.getChar("trim", 0);
+  roverNumber = prefs.getUChar("num", 0);
+  if (roverNumber > 99) roverNumber = 0;
   Headlights::setLastOnLevel(prefs.getUChar("lightpct", HEADLIGHT_DEFAULT_PCT));
   prefs.end();
   savedLightPct = Headlights::lastOnLevel();   // lights themselves start OFF
 
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  luneRoverName(roverName, sizeof(roverName), "Glyph", roverNumber, mac);
+  luneRoverId(roverId, sizeof(roverId), roverNumber, mac);
+  // Short name for Connect's screen (PAIR_ACK holds 11 characters).
+  char ackName[12];
+  if (roverNumber) snprintf(ackName, sizeof(ackName), "%s", roverName);
+  else snprintf(ackName, sizeof(ackName), "Glyph %s", roverId);
+  Serial.printf("[lune] %s  MAC %02X:%02X:%02X:%02X:%02X:%02X\n", roverName, mac[0], mac[1], mac[2],
+                mac[3], mac[4], mac[5]);
+
   Control::begin();
   bool oled = Eyes::begin();
   Serial.printf("[lune] OLED %s\n", oled ? "found" : "not found");
-  Radio::begin("Lun-E Glyph");
+  Radio::begin(ackName, roverNumber);
   BleApp::begin(roverName);
 
   // The wake-up eye animation is the greeting; only nag when unpaired.
@@ -322,12 +375,13 @@ void loop() {
   while (Control::popCmd(c)) handleCmd(c);
 
   Radio::loop();
-  // Only the timed pairing window (double-click / app). Radio::pairing() is also
+  // Only the timed pairing window (triple-click / app). Radio::pairing() is also
   // true whenever no Connect is paired yet, which would blink forever.
   Headlights::setPairing(Radio::pairingWindow());
   static uint32_t pairedAt = 0;
   if (Radio::takePairedEvent()) {
-    Eyes::say("PAIRED!", 1500);
+    Eyes::showId(roverId, 2000);   // which rover just paired
+    Eyes::say("PAIRED!", 3500);    // shows under the eyes once the number goes
     Headlights::cuePaired();
     pairedAt = millis() | 1;
   }
@@ -343,7 +397,7 @@ void loop() {
   }
   int ble = BleApp::takeLinkEvent();
   if (ble > 0) {
-    Eyes::say("APP", 1000);
+    Eyes::showId(roverId, 2000);   // "you connected to this one"
     Headlights::cueLinked();
   } else if (ble < 0) {
     Eyes::say("APP LEFT", 1000);

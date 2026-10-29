@@ -9,7 +9,8 @@
 #pragma once
 #include <stdint.h>
 
-#define LUNE_PROTO_VERSION 3  // v3: headlights back (lightsSeq in CONTROL, lights level in TELEMETRY + BLE status)
+#define LUNE_PROTO_VERSION 4  // v4: rover numbers (`number` in PAIR_ACK / TELEMETRY / BLE status), find-me
+// v3: headlights back (lightsSeq in CONTROL, lights level in TELEMETRY + BLE status)
 #define LUNE_MAGIC0 'L'
 #define LUNE_MAGIC1 'E'
 
@@ -59,7 +60,8 @@ struct LunePairReq {
 
 struct LunePairAck {
   LuneHeader h;
-  char name[12];     // rover name, NUL padded
+  char name[12];     // rover name, NUL padded, e.g. "Lun-E 07"
+  uint8_t number;    // v4: rover number 1..99, 0 = not numbered yet
 };
 
 struct LuneControl {
@@ -87,6 +89,7 @@ struct LuneTelemetry {
   int8_t  right;
   int8_t  rssi;       // RSSI of the last Connect packet seen by the rover (dBm)
   uint8_t lights;     // headlight brightness 0 (off) .. 100 %
+  uint8_t number;     // v4: rover number 1..99, 0 = not numbered yet
 };
 #pragma pack(pop)
 
@@ -108,6 +111,8 @@ enum LuneBleCmd : uint8_t {
   LUNE_CMD_TRIM    = 0x03,  // arg: int8 -30..30, + = steer right; saved to flash
   LUNE_CMD_PAIR    = 0x04,  // arg: ignored. Open a 30 s window to pair a Connect
   LUNE_CMD_SLEEP   = 0x05,  // arg: ignored. Deep sleep now (wake with the button)
+  LUNE_CMD_NUMBER  = 0x06,  // v4. arg: 1..99 sets the rover number, 0 clears it. Saved; rover restarts
+  LUNE_CMD_IDENTIFY = 0x07, // v4. arg: ignored. "Find me": number big on the OLED + blink + wiggle
 };
 
 // Special LUNE_CMD_LIGHTS arguments (int8).
@@ -126,8 +131,23 @@ struct LuneBleStatus {
   int8_t   connectRssi;
   uint16_t uptimeS;   // little endian
   uint8_t  lights;    // headlight brightness 0 (off) .. 100 % (v3; apps accept 10-byte v2 status)
+  uint8_t  number;    // v4: rover number 1..99, 0 = not numbered yet
 };
 #pragma pack(pop)
+
+// Rover names (v4). `model` is "RC" or "Glyph".
+//   BLE name:  numbered "Lun-E 07"   unnumbered "Lun-E RC-A3F1"
+//   short id:  numbered "07"         unnumbered "A3F1"   (what the OLED shows)
+#include <stdio.h>
+static inline void luneRoverName(char *out, int size, const char *model, uint8_t number,
+                                 const uint8_t mac[6]) {
+  if (number >= 1 && number <= 99) snprintf(out, size, "Lun-E %02u", (unsigned)number);
+  else snprintf(out, size, "Lun-E %s-%02X%02X", model, mac[4], mac[5]);
+}
+static inline void luneRoverId(char *out, int size, uint8_t number, const uint8_t mac[6]) {
+  if (number >= 1 && number <= 99) snprintf(out, size, "%02u", (unsigned)number);
+  else snprintf(out, size, "%02X%02X", mac[4], mac[5]);
+}
 
 static inline void luneFillHeader(LuneHeader &h, uint8_t type, uint8_t seq) {
   h.magic[0] = LUNE_MAGIC0;

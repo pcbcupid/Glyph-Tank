@@ -16,6 +16,10 @@ void lookAt(int x, int y, bool active);
 // Short caption under the eyes, e.g. "PAIRED". Shown for ms. Captions asked
 // for during the wake-up animation appear once it has finished.
 void say(const char *text, uint32_t ms = 1200);
+// Show the rover's number big in place of the eyes for ms, e.g. "07" or
+// "A3F1" — used for "find me", when a phone connects and after pairing.
+// Waits for the wake-up animation if it is still playing.
+void showId(const char *id, uint32_t ms = 3000);
 // Start the falling-asleep animation (lids droop, nod, close, "z z"), after
 // which the panel turns off. Returns immediately; safe to call twice.
 void startSleep();
